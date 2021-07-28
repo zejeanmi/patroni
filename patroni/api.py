@@ -12,6 +12,7 @@ import six
 import socket
 import sys
 
+from ipaddress import ip_address, ip_network as _ip_network
 from six.moves.BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
 from six.moves.socketserver import ThreadingMixIn
 from six.moves.urllib_parse import urlparse, parse_qs
@@ -23,6 +24,10 @@ from .utils import deep_compare, enable_keepalive, parse_bool, patch_config, Ret
     RetryFailedError, parse_int, split_host_port, tzutc, uri, cluster_as_json
 
 logger = logging.getLogger(__name__)
+
+
+def ip_network(value):
+    return _ip_network(value.decode('utf-8') if six.PY2 else value, False)
 
 
 class RestApiHandler(BaseHTTPRequestHandler):
@@ -47,17 +52,17 @@ class RestApiHandler(BaseHTTPRequestHandler):
     def _write_json_response(self, status_code, response):
         self._write_response(status_code, json.dumps(response, default=str), content_type='application/json')
 
-    def check_auth(func):
-        """Decorator function to check authorization header or client certificates
+    def check_access(func):
+        """Decorator function to check the source ip, authorization header. or client certificates
 
         Usage example:
-        @check_auth
+        @check_access
         def do_PUT_foo():
             pass
         """
 
         def wrapper(self, *args, **kwargs):
-            if self.server.check_auth(self):
+            if self.server.check_access(self):
                 return func(self, *args, **kwargs)
 
         return wrapper
@@ -108,9 +113,11 @@ class RestApiHandler(BaseHTTPRequestHandler):
             response.get('role') == 'replica' and response.get('state') == 'running' else 503
 
         if not cluster and patroni.ha.is_paused():
+            leader_status_code = 200 if response.get('role') in ('master', 'standby_leader') else 503
             primary_status_code = 200 if response.get('role') == 'master' else 503
             standby_leader_status_code = 200 if response.get('role') == 'standby_leader' else 503
         elif patroni.ha.is_leader():
+            leader_status_code = 200
             if patroni.ha.is_standby_cluster():
                 primary_status_code = replica_status_code = 503
                 standby_leader_status_code = 200 if response.get('role') in ('replica', 'standby_leader') else 503
@@ -118,14 +125,20 @@ class RestApiHandler(BaseHTTPRequestHandler):
                 primary_status_code = 200
                 standby_leader_status_code = 503
         else:
-            primary_status_code = standby_leader_status_code = 503
+            leader_status_code = primary_status_code = standby_leader_status_code = 503
 
         status_code = 503
 
+        ignore_tags = False
         if 'standby_leader' in path or 'standby-leader' in path:
             status_code = standby_leader_status_code
-        elif 'master' in path or 'leader' in path or 'primary' in path or 'read-write' in path:
+            ignore_tags = True
+        elif 'leader' in path:
+            status_code = leader_status_code
+            ignore_tags = True
+        elif 'master' in path or 'primary' in path or 'read-write' in path:
             status_code = primary_status_code
+            ignore_tags = True
         elif 'replica' in path:
             status_code = replica_status_code
         elif 'read-only' in path:
@@ -139,6 +152,25 @@ class RestApiHandler(BaseHTTPRequestHandler):
                 status_code = replica_status_code
             elif path in ('/async', '/asynchronous') and not is_synchronous:
                 status_code = replica_status_code
+
+        # check for user defined tags in query params
+        if not ignore_tags and status_code == 200:
+            qs_tag_prefix = "tag_"
+            for qs_key, qs_value in self.path_query.items():
+                if not qs_key.startswith(qs_tag_prefix):
+                    continue
+                qs_key = qs_key[len(qs_tag_prefix):]
+                qs_value = qs_value[0]
+                instance_tag_value = patroni.tags.get(qs_key)
+                # tag not registered for instance
+                if instance_tag_value is None:
+                    status_code = 503
+                    break
+                if not isinstance(instance_tag_value, six.string_types):
+                    instance_tag_value = str(instance_tag_value).lower()
+                if instance_tag_value != qs_value:
+                    status_code = 503
+                    break
 
         if write_status_code_only:  # when haproxy sends OPTIONS request it reads only status code and nothing more
             self._write_status_code_only(status_code)
@@ -187,73 +219,74 @@ class RestApiHandler(BaseHTTPRequestHandler):
 
         metrics = []
 
+        scope_label = '{{scope="{0}"}}'.format(patroni.postgresql.scope)
         metrics.append("# HELP patroni_version Patroni semver without periods.")
         metrics.append("# TYPE patroni_version gauge")
         padded_semver = ''.join([x.zfill(2) for x in patroni.version.split('.')])  # 2.0.2 => 020002
-        metrics.append("patroni_version {0}".format(padded_semver))
+        metrics.append("patroni_version{0} {1}".format(scope_label, padded_semver))
 
         metrics.append("# HELP patroni_postgres_running Value is 1 if Postgres is running, 0 otherwise.")
         metrics.append("# TYPE patroni_postgres_running gauge")
-        metrics.append("patroni_postgres_running {0}".format(int(postgres['state'] == 'running')))
+        metrics.append("patroni_postgres_running{0} {1}".format(scope_label, int(postgres['state'] == 'running')))
 
         metrics.append("# HELP patroni_postmaster_start_time Epoch seconds since Postgres started.")
         metrics.append("# TYPE patroni_postmaster_start_time gauge")
         postmaster_start_time = postgres.get('postmaster_start_time')
         postmaster_start_time = (postmaster_start_time - epoch).total_seconds() if postmaster_start_time else 0
-        metrics.append("patroni_postmaster_start_time {0}".format(postmaster_start_time))
+        metrics.append("patroni_postmaster_start_time{0} {1}".format(scope_label, postmaster_start_time))
 
         metrics.append("# HELP patroni_master Value is 1 if this node is the leader, 0 otherwise.")
         metrics.append("# TYPE patroni_master gauge")
-        metrics.append("patroni_master {0}".format(int(postgres['role'] == 'master')))
+        metrics.append("patroni_master{0} {1}".format(scope_label, int(postgres['role'] == 'master')))
 
         metrics.append("# HELP patroni_xlog_location Current location of the Postgres"
                        " transaction log, 0 if this node is not the leader.")
         metrics.append("# TYPE patroni_xlog_location counter")
-        metrics.append("patroni_xlog_location {0}".format(postgres.get('xlog', {}).get('location', 0)))
+        metrics.append("patroni_xlog_location{0} {1}".format(scope_label, postgres.get('xlog', {}).get('location', 0)))
 
         metrics.append("# HELP patroni_standby_leader Value is 1 if this node is the standby_leader, 0 otherwise.")
         metrics.append("# TYPE patroni_standby_leader gauge")
-        metrics.append("patroni_standby_leader {0}".format(int(postgres['role'] == 'standby_leader')))
+        metrics.append("patroni_standby_leader{0} {1}".format(scope_label, int(postgres['role'] == 'standby_leader')))
 
         metrics.append("# HELP patroni_replica Value is 1 if this node is a replica, 0 otherwise.")
         metrics.append("# TYPE patroni_replica gauge")
-        metrics.append("patroni_replica {0}".format(int(postgres['role'] == 'replica')))
+        metrics.append("patroni_replica{0} {1}".format(scope_label, int(postgres['role'] == 'replica')))
 
         metrics.append("# HELP patroni_xlog_received_location Current location of the received"
                        " Postgres transaction log, 0 if this node is not a replica.")
         metrics.append("# TYPE patroni_xlog_received_location counter")
-        metrics.append("patroni_xlog_received_location {0}".format(
-                        postgres.get('xlog', {}).get('received_location', 0)))
+        metrics.append("patroni_xlog_received_location{0} {1}"
+                       .format(scope_label, postgres.get('xlog', {}).get('received_location', 0)))
 
         metrics.append("# HELP patroni_xlog_replayed_location Current location of the replayed"
                        " Postgres transaction log, 0 if this node is not a replica.")
         metrics.append("# TYPE patroni_xlog_replayed_location counter")
-        metrics.append("patroni_xlog_replayed_location {0}".format(
-                        postgres.get('xlog', {}).get('replayed_location', 0)))
+        metrics.append("patroni_xlog_replayed_location{0} {1}"
+                       .format(scope_label, postgres.get('xlog', {}).get('replayed_location', 0)))
 
         metrics.append("# HELP patroni_xlog_replayed_timestamp Current timestamp of the replayed"
                        " Postgres transaction log, 0 if null.")
         metrics.append("# TYPE patroni_xlog_replayed_timestamp gauge")
         replayed_timestamp = postgres.get('xlog', {}).get('replayed_timestamp')
         replayed_timestamp = (replayed_timestamp - epoch).total_seconds() if replayed_timestamp else 0
-        metrics.append("patroni_xlog_replayed_timestamp {0}".format(replayed_timestamp))
+        metrics.append("patroni_xlog_replayed_timestamp{0} {1}".format(scope_label, replayed_timestamp))
 
         metrics.append("# HELP patroni_xlog_paused Value is 1 if the Postgres xlog is paused, 0 otherwise.")
         metrics.append("# TYPE patroni_xlog_paused gauge")
-        metrics.append("patroni_xlog_paused {0}".format(
-                        int(postgres.get('xlog', {}).get('paused', False) is True)))
+        metrics.append("patroni_xlog_paused{0} {1}"
+                       .format(scope_label, int(postgres.get('xlog', {}).get('paused', False) is True)))
 
         metrics.append("# HELP patroni_postgres_server_version Version of Postgres (if running), 0 otherwise.")
         metrics.append("# TYPE patroni_postgres_server_version gauge")
-        metrics.append("patroni_postgres_server_version {0}".format(postgres.get('server_version', 0)))
+        metrics.append("patroni_postgres_server_version {0} {1}".format(scope_label, postgres.get('server_version', 0)))
 
         metrics.append("# HELP patroni_cluster_unlocked Value is 1 if the cluster is unlocked, 0 if locked.")
         metrics.append("# TYPE patroni_cluster_unlocked gauge")
-        metrics.append("patroni_cluster_unlocked {0}".format(int(postgres['cluster_unlocked'])))
+        metrics.append("patroni_cluster_unlocked{0} {1}".format(scope_label, int(postgres['cluster_unlocked'])))
 
         metrics.append("# HELP patroni_postgres_timeline Postgres timeline of this node (if running), 0 otherwise.")
         metrics.append("# TYPE patroni_postgres_timeline counter")
-        metrics.append("patroni_postgres_timeline {0}".format(postgres.get('timeline', 0)))
+        metrics.append("patroni_postgres_timeline{0} {1}".format(scope_label, postgres.get('timeline', 0)))
 
         self._write_response(200, '\n'.join(metrics)+'\n', content_type='text/plain')
 
@@ -271,7 +304,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
             logger.exception('Bad request')
         self.send_error(400)
 
-    @check_auth
+    @check_access
     def do_PATCH_config(self):
         request = self._read_json_content()
         if request:
@@ -286,7 +319,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
             self.server.patroni.ha.wakeup()
             self._write_json_response(200, data)
 
-    @check_auth
+    @check_access
     def do_PUT_config(self):
         request = self._read_json_content()
         if request:
@@ -297,7 +330,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
                     return self.send_error(502)
             self._write_json_response(200, request)
 
-    @check_auth
+    @check_access
     def do_POST_reload(self):
         self.server.patroni.sighup_handler()
         self._write_response(202, 'reload scheduled')
@@ -323,7 +356,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
             status_code = 422
         return (status_code, error, scheduled_at)
 
-    @check_auth
+    @check_access
     def do_POST_restart(self):
         status_code = 500
         data = 'restart failed'
@@ -384,7 +417,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
                     status_code = 409
         self._write_response(status_code, data)
 
-    @check_auth
+    @check_access
     def do_DELETE_restart(self):
         if self.server.patroni.ha.delete_future_restart():
             data = "scheduled restart deleted"
@@ -394,7 +427,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
             code = 404
         self._write_response(code, data)
 
-    @check_auth
+    @check_access
     def do_DELETE_switchover(self):
         failover = self.server.patroni.dcs.get_cluster().failover
         if failover and failover.scheduled_at:
@@ -408,7 +441,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
             code = 404
         self._write_response(code, data)
 
-    @check_auth
+    @check_access
     def do_POST_reinitialize(self):
         request = self._read_json_content(body_is_optional=True)
 
@@ -440,7 +473,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
                 if not cluster.failover:
                     return 503, action.title() + ' failed'
             except Exception as e:
-                logger.debug('Exception occured during polling %s result: %s', action, e)
+                logger.debug('Exception occurred during polling %s result: %s', action, e)
         return 503, action.title() + ' status unknown'
 
     def is_failover_possible(self, cluster, leader, candidate, action):
@@ -465,7 +498,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
                 return None
         return action + ' is not possible: no good candidates have been found'
 
-    @check_auth
+    @check_access
     def do_POST_failover(self, action='failover'):
         request = self._read_json_content()
         (status_code, data) = (400, '')
@@ -613,11 +646,10 @@ class RestApiServer(ThreadingMixIn, HTTPServer, Thread):
         self.patroni = patroni
         self.__listen = None
         self.__ssl_options = None
-        self.http_extra_headers = {}
-        self.reload_config(config)
-        self.daemon = True
         self.__ssl_serial_number = None
         self._received_new_cert = False
+        self.reload_config(config)
+        self.daemon = True
 
     def query(self, sql, *params):
         cursor = None
@@ -647,7 +679,35 @@ class RestApiServer(ThreadingMixIn, HTTPServer, Thread):
             if not auth_header.startswith('Basic ') or not self.check_basic_auth_key(auth_header[6:]):
                 return 'not authenticated'
 
-    def check_auth(self, rh):
+    @staticmethod
+    def __resolve_ips(host, port):
+        try:
+            for _, _, _, _, sa in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM, socket.IPPROTO_TCP):
+                yield ip_network(sa[0])
+        except Exception as e:
+            logger.error('Failed to resolve %s: %r', host, e)
+
+    def __members_ips(self):
+        cluster = self.patroni.dcs.cluster
+        if self.__allowlist_include_members and cluster:
+            for member in cluster.members:
+                if member.api_url:
+                    try:
+                        r = urlparse(member.api_url)
+                        host = r.hostname
+                        port = r.port or (443 if r.scheme == 'https' else 80)
+                        for ip in self.__resolve_ips(host, port):
+                            yield ip
+                    except Exception as e:
+                        logger.debug('Failed to parse url %s: %r', member.api_url, e)
+
+    def check_access(self, rh):
+        if self.__allowlist or self.__allowlist_include_members:
+            incoming_ip = rh.client_address[0]
+            incoming_ip = ip_address(incoming_ip.decode('utf-8') if six.PY2 else incoming_ip)
+            if not any(incoming_ip in net for net in self.__allowlist + tuple(self.__members_ips())):
+                return rh._write_response(403, 'Access is denied')
+
         if not hasattr(rh.request, 'getpeercert') or not rh.request.getpeercert():  # valid client cert isn't present
             if self.__protocol == 'https' and self.__ssl_options.get('verify_client') in ('required', 'optional'):
                 return rh._write_response(403, 'client certificate required')
@@ -771,9 +831,24 @@ class RestApiServer(ThreadingMixIn, HTTPServer, Thread):
                 self.__ssl_serial_number = on_disk_cert_serial_number
                 return True
 
+    def _build_allowlist(self, value):
+        if isinstance(value, list):
+            for v in value:
+                if '/' in v:  # netmask
+                    try:
+                        yield ip_network(v)
+                    except Exception as e:
+                        logger.error('Invalid value "%s" in the allowlist: %r', v, e)
+                else:  # ip or hostname, try to resolve it
+                    for ip in self.__resolve_ips(v, 8080):
+                        yield ip
+
     def reload_config(self, config):
         if 'listen' not in config:  # changing config in runtime
             raise ValueError('Can not find "restapi.listen" config')
+
+        self.__allowlist = tuple(self._build_allowlist(config.get('allowlist')))
+        self.__allowlist_include_members = config.get('allowlist_include_members')
 
         ssl_options = {n: config[n] for n in ('certfile', 'keyfile', 'keyfile_password',
                                               'cafile', 'ciphers') if n in config}

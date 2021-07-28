@@ -68,23 +68,14 @@ class Rewind(object):
     def _get_checkpoint_end(self, timeline, lsn):
         """The checkpoint record size in WAL depends on postgres major version and platform (memory alignment).
         Hence, the only reliable way to figure out where it ends, read the record from file with the help of pg_waldump
-        and parse the output. We are trying to read two records, and expect that it wil fail to read the second one:
+        and parse the output. We are trying to read two records, and expect that it will fail to read the second one:
         `pg_waldump: fatal: error in WAL record at 0/182E220: invalid record length at 0/182E298: wanted 24, got 0`
         The error message contains information about LSN of the next record, which is exactly where checkpoint ends."""
 
-        cmd = self._postgresql.pgcommand('pg_{0}dump'.format(self._postgresql.wal_name))
         lsn8 = format_lsn(lsn, True)
         lsn = format_lsn(lsn)
-        env = os.environ.copy()
-        env.update(LANG='C', LC_ALL='C', PGDATA=self._postgresql.data_dir)
-        try:
-            waldump = subprocess.Popen([cmd, '-t', str(timeline), '-s', lsn, '-n', '2'],
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
-            out, err = waldump.communicate()
-            waldump.wait()
-        except Exception as e:
-            logger.error('Failed to execute `%s -t %s -s %s -n 2`: %r', cmd, timeline, lsn, e)
-        else:
+        out, err = self._postgresql.waldump(timeline, lsn, 2)
+        if out is not None and err is not None:
             out = out.decode('utf-8').rstrip().split('\n')
             err = err.decode('utf-8').rstrip().split('\n')
             pattern = 'error in WAL record at {0}: invalid record length at '.format(lsn)
@@ -97,7 +88,7 @@ class Rewind(object):
                         return parse_lsn(err[0][i:j])
                     except Exception as e:
                         logger.error('Failed to parse lsn %s: %r', err[0][i:j], e)
-            logger.error('Failed to parse `%s -t %s -s %s -n 2` output', cmd, timeline, lsn)
+            logger.error('Failed to parse pg_%sdump output', self._postgresql.wal_name)
             logger.error(' stdout=%s', '\n'.join(out))
             logger.error(' stderr=%s', '\n'.join(err))
 
@@ -189,7 +180,9 @@ class Rewind(object):
                     need_rewind = False
                 elif master_timeline > 1:
                     cur.execute('TIMELINE_HISTORY %s', (master_timeline,))
-                    history = bytes(cur.fetchone()[1]).decode('utf-8')
+                    history = cur.fetchone()[1]
+                    if not isinstance(history, six.string_types):
+                        history = bytes(history).decode('utf-8')
                     logger.debug('master: history=%s', history)
         except Exception:
             return logger.exception('Exception when working with master via replication connection')

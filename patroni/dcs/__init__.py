@@ -68,7 +68,11 @@ def dcs_modules():
 
     if getattr(sys, 'frozen', False):
         toc = set()
-        for importer in pkgutil.iter_importers(dcs_dirname):
+        # dcs_dirname may contain a dot, which causes pkgutil.iter_importers()
+        # to misinterpret the path as a package name. This can be avoided
+        # altogether by not passing a path at all, because PyInstaller's
+        # FrozenImporter is a singleton and registered as top-level finder.
+        for importer in pkgutil.iter_importers():
             if hasattr(importer, 'toc'):
                 toc |= importer.toc
         return [module for module in toc if module.startswith(module_prefix) and module.count('.') == 2]
@@ -630,7 +634,7 @@ class AbstractDCS(object):
     _HISTORY = 'history'
     _MEMBERS = 'members/'
     _OPTIME = 'optime'
-    _STATUS = 'status'  # JSON, containts "leader_lsn" and confirmed_flush_lsn of logical "slots" on the leader
+    _STATUS = 'status'  # JSON, contains "leader_lsn" and confirmed_flush_lsn of logical "slots" on the leader
     _LEADER_OPTIME = _OPTIME + '/' + _LEADER  # legacy
     _SYNC = 'sync'
 
@@ -778,7 +782,7 @@ class AbstractDCS(object):
             self._last_status = value
         cluster = self.cluster
         min_version = cluster and cluster.min_version
-        if min_version and min_version < (2, 0, 3):
+        if min_version and min_version < (2, 1, 0):
             self._write_leader_optime(str(value[self._OPTIME]))
 
     @abc.abstractmethod

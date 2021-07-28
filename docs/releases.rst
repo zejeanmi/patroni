@@ -3,6 +3,98 @@
 Release notes
 =============
 
+Version 2.1.0
+-------------
+
+This version adds compatibility with PostgreSQL v14, makes logical replication slots to survive failover/switchover, implements support of allowlist for REST API, and also reducing the number of logs to one line per heart-beat.
+
+**New features**
+
+- Compatibility with PostgreSQL v14 (Alexander Kukushkin)
+
+  Unpause WAL replay if Patroni is not in a "pause" mode itself. It could be "paused" due to the change of certain parameters like for example ``max_connections`` on the primary.
+
+- Failover logical slots (Alexander)
+
+  Make logical replication slots survive failover/switchover on PostgreSQL v11+. The replication slot if copied from the primary to the replica with restart and later the `pg_replication_slot_advance() <https://www.postgresql.org/docs/11/functions-admin.html#id-1.5.8.31.8.5.2.2.8.1.1>`__ function is used to move it forward. As a result, the slot will already exist before the failover and no events should be lost, but, there is a chance that some events could be delivered more than once.
+
+- Implemented allowlist for Patroni REST API (Alexander)
+
+  If configured, only IP's that matching rules would be allowed to call unsafe endpoints. In addition to that, it is possible to automatically include IP's of members of the cluster to the list.
+
+- Added support of replication connections via unix socket (Mohamad El-Rifai)
+
+  Previously Patroni was always using TCP for replication connection what could cause some issues with SSL verification. Using unix sockets allows exempt replication user from SSL verification.
+
+- Health check on user-defined tags (Arman Jafari Tehrani)
+
+  Along with :ref:`predefined tags: <tags_settings>` it is possible to specify any number of custom tags that become visible in the ``patronictl list`` output and in the REST API. From now on it is possible to use custom tags in health checks.
+
+- Added Prometheus ``/metrics`` endpoint (Mark Mercado, Michael Banck)
+
+  The endpoint exposing the same metrics as ``/patroni``.
+
+- Reduced chattiness of Patroni logs (Alexander)
+
+  When everything goes normal, only one line will be written for every run of HA loop.
+
+
+**Breaking changes**
+
+- The old ``permanent logical replication slots`` feature will no longer work with PostgreSQL v10 and older (Alexander)
+
+  The strategy of creating the logical slots after performing a promotion can't guaranty that no logical events are lost and therefore disabled.
+
+- The ``/leader`` endpoint always returns 200 if the node holds the lock (Alexander)
+
+  Promoting the standby cluster requires updating load-balancer health checks, which is not very convenient and easy to forget. To solve it, we change the behavior of the ``/leader`` health check endpoint. It will return 200 without taking into account whether the cluster is normal or the ``standby_cluster``.
+
+
+**Improvements in Raft support**
+
+- Reliable support of Raft traffic encryption (Alexander)
+
+  Due to the different issues in the ``PySyncObj`` the encryption support was very unstable
+
+- Handle DNS issues in Raft implementation (Alexander)
+
+  If ``self_addr`` and/or ``partner_addrs`` are configured using the DNS name instead of IP's the ``PySyncObj`` was effectively doing resolve only once when the object is created. It was causing problems when the same node was coming back online with a different IP.
+
+
+**Stability improvements**
+
+- Compatibility with ``psycopg2-2.9+`` (Alexander)
+
+  In ``psycopg2`` the ``autocommit = True`` is ignored in the ``with connection`` block, which breaks replication protocol connections.
+
+- Fix excessive HA loop runs with Zookeeper (Alexander)
+
+  Update of member ZNodes was causing a chain reaction and resulted in running the HA loops multiple times in a row.
+
+- Reload if REST API certificate is changed on disk (Michael Todorovic)
+
+  If the REST API certificate file was updated in place Patroni didn't perform a reload.
+
+- Don't create pgpass dir if kerberos auth is used (Kostiantyn Nemchenko)
+
+  Kerberos and password authentication are mutually exclusive.
+
+- Fixed little issues with custom bootstrap (Alexander)
+
+  Start Postgres with ``hot_standby=off`` only when we do a PITR and restart it after PITR is done.
+
+
+**Bugfixes**
+
+- Compatibility with ``kazoo-2.7+`` (Alexander)
+
+  Since Patroni is handling retries on its own, it is relying on the old behavior of ``kazoo`` that requests to a Zookeeper cluster are immediately discarded when there are no connections available.
+
+- Explicitly request the version of Etcd v3 cluster when it is known that we are connecting via proxy (Alexander)
+
+  Patroni is working with Etcd v3 cluster via gPRC-gateway and it depending on the cluster version different endpoints (``/v3``, ``/v3beta``, or ``/v3alpha``) must be used. The version was resolved only together with the cluster topology, but since the latter was never done when connecting via proxy.
+
+
 Version 2.0.2
 -------------
 
@@ -682,7 +774,7 @@ Version 1.6.1
 
 - Some improvements in logging infrastructure (Alexander Kukushkin)
 
-  Previously threre was a possibility to loose the last few log lines on shutdown because the logging thread was a ``daemon`` thread.
+  Previously there was a possibility to loose the last few log lines on shutdown because the logging thread was a ``daemon`` thread.
 
 - Use ``spawn`` multiprocessing start method on python 3.4+ (Maciej Kowalczyk)
 
@@ -732,7 +824,7 @@ Version 1.6.1
 
   If the method is executed from the REST API thread, it requires a separate cursor object to be created.
 
-- Fix the problem of not promoting the sync standby that had a name contaning upper case letters (Alexander Kukushkin)
+- Fix the problem of not promoting the sync standby that had a name containing upper case letters (Alexander Kukushkin)
 
   We converted the name to the lower case because Postgres was doing the same while comparing the ``application_name`` with the value in ``synchronous_standby_names``.
 
@@ -1008,7 +1100,7 @@ Compatibility and bugfix release.
 
 - Fix broken compatibility with postgres 9.3 (Alexander)
 
-  When opening a replication connection we should specify replication=1, beacuse 9.3 does not understand replication='database'
+  When opening a replication connection we should specify replication=1, because 9.3 does not understand replication='database'
 
 - Make sure we refresh Consul session at least once per HA loop and improve handling of consul sessions exceptions (Alexander)
 
@@ -1093,7 +1185,7 @@ This version enables Patroni HA cluster to operate in a standby mode, introduces
 
 - Immediately reserve the WAL position upon creation of the replication slot (Alexander Kukushkin)
 
-  Starting from 9.6, `pg_create_physical_replication_slot` function provides an additional boolean parameter `immediately_reserve`. When it is set to `false`, which is also the default, the slot doesn't reserve the WAL position until it receives the first client connection, potentially losing some segments required by the client in a time window between the slot creation and the intiial client connection.
+  Starting from 9.6, `pg_create_physical_replication_slot` function provides an additional boolean parameter `immediately_reserve`. When it is set to `false`, which is also the default, the slot doesn't reserve the WAL position until it receives the first client connection, potentially losing some segments required by the client in a time window between the slot creation and the initial client connection.
 
 - Fix bug in strict synchronous replication (Alexander Kukushkin)
 
@@ -1333,7 +1425,7 @@ This version adds support for using Kubernetes as a DCS, allowing to run Patroni
 
 **Upgrade notice**
 
-Installing Patroni via pip will no longer bring in dependencies for (such as libraries for Etcd, Zookeper, Consul or Kubernetes, or support for AWS). In order to enable them one need to list them in pip install command explicitely, for instance `pip install patroni[etcd,kubernetes]`.
+Installing Patroni via pip will no longer bring in dependencies for (such as libraries for Etcd, Zookeper, Consul or Kubernetes, or support for AWS). In order to enable them one need to list them in pip install command explicitly, for instance `pip install patroni[etcd,kubernetes]`.
 
 **Kubernetes support**
 
@@ -1352,7 +1444,7 @@ In addition to using Endpoints, Patroni supports ConfigMaps. You can find more i
 
 - Remove leader key on shutdown only when we have the lock (Ants)
 
-  Unconditional removal was generating unnecessary and missleading exceptions.
+  Unconditional removal was generating unnecessary and misleading exceptions.
 
 **Improvements in patronictl**
 
@@ -1383,7 +1475,7 @@ In addition to using Endpoints, Patroni supports ConfigMaps. You can find more i
 
 - Alter the behavior of ``patronictl failover`` (Alexander)
 
-  It will work even if there is no leader, but in that case you will have to explicitely specify a node which should become the new leader.
+  It will work even if there is no leader, but in that case you will have to explicitly specify a node which should become the new leader.
 
 **Expose information about timeline and history**
 
@@ -1399,7 +1491,7 @@ In addition to using Endpoints, Patroni supports ConfigMaps. You can find more i
 
 - Add new /sync and /async endpoints (Alexander, Oleksii Kliukin)
 
- Those endpoints (also accessible as /synchronous and /asynchronous) return 200 only for synchronous and asynchornous replicas correspondingly (exclusing those marked as `noloadbalance`).
+ Those endpoints (also accessible as /synchronous and /asynchronous) return 200 only for synchronous and asynchronous replicas correspondingly (exclusing those marked as `noloadbalance`).
 
 **Allow multiple hosts for Etcd**
 
@@ -1487,7 +1579,7 @@ Version 1.3.4
 
 - Pass the consul token as a header (Andrew Colin Kissa)
 
-  Headers are now the prefered way to pass the token to the consul `API <https://www.consul.io/api/index.html#authentication>`__.
+  Headers are now the preferred way to pass the token to the consul `API <https://www.consul.io/api/index.html#authentication>`__.
 
 
 - Advanced configuration for Consul (Alexander Kukushkin)
@@ -1805,7 +1897,7 @@ In addition, patronictl supports new ``pause`` and ``resume`` commands to toggle
   Originally, ping_timeout and connect_timeout values were calculated from the negotiated session timeout. Patroni loop_wait was not taken into account. As
   a result, a single retry could take more time than the session timeout, forcing Patroni to release the lock and demote.
 
-  This change set ping and connect timeout to half of the value of loop_wait, speeding up detection of connection issues and  leaving enough time to retry the connection attempt before loosing the lock.
+  This change set ping and connect timeout to half of the value of loop_wait, speeding up detection of connection issues and  leaving enough time to retry the connection attempt before losing the lock.
 
 - Update Etcd topology only after original request succeed (Alexander)
 
@@ -1883,7 +1975,7 @@ When upgrading from v0.90 or below, always upgrade all replicas before the maste
 
   See the :ref:`dynamic configuration <dynamic_configuration>`  for the details on which parameters can be changed and the order of processing difference configuration sources.
 
-  The configuration file format *has changed* since the v0.90. Patroni is still compatible with the old configuration files, but in order to take advantage of the bootstrap parameters one needs to change it. Users are encourage to update them by referring to the :ref:`dynamic configuraton documentation page <dynamic_configuration>`.
+  The configuration file format *has changed* since the v0.90. Patroni is still compatible with the old configuration files, but in order to take advantage of the bootstrap parameters one needs to change it. Users are encourage to update them by referring to the :ref:`dynamic configuration documentation page <dynamic_configuration>`.
 
 **More flexible configuration***
 

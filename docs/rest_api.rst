@@ -9,13 +9,16 @@ Health check endpoints
 ----------------------
 For all health check ``GET`` requests Patroni returns a JSON document with the status of the node, along with the HTTP status code. If you don't want or don't need the JSON document, you might consider using the ``OPTIONS`` method instead of ``GET``.
 
-- The following requests to Patroni REST API will return HTTP status code **200** only when the Patroni node is running as the leader:
+- The following requests to Patroni REST API will return HTTP status code **200** only when the Patroni node is running as the primary with leader lock:
 
   - ``GET /``
   - ``GET /master``
-  - ``GET /leader``
   - ``GET /primary``
   - ``GET /read-write``
+
+- ``GET /standby-leader``: returns HTTP status code **200** only when the Patroni node is running as the leader in a :ref:`standby cluster <standby_cluster>`.
+
+- ``GET /leader``: returns HTTP status code **200** when the Patroni node has the leader lock. The major difference from the two previous endpoints is that it doesn't take into account whether PostgreSQL is running as the ``primary`` or the ``standby_leader``.
 
 - ``GET /replica``: replica health check endpoint. It returns HTTP status code **200** only when the Patroni node is in the state ``running``, the role is ``replica`` and ``noloadbalance`` tag is not set.
 
@@ -26,9 +29,18 @@ For all health check ``GET`` requests Patroni returns a JSON document with the s
   - ``GET /replica?lag=10MB``
   - ``GET /replica?lag=1GB``
 
-- ``GET /read-only``: like the above endpoint, but also includes the primary.
+- ``GET /replica?tag_key1=value1&tag_key2=value2``: replica check endpoint. In addition, It will also check for user defined tags ``key1`` and ``key2`` and their respective values in the **tags** section of the yaml configuration management. If the tag isn't defined for an instance, or if the value in the yaml configuration doesn't match the querying value, it will return HTTP Status Code 503.
 
-- ``GET /standby-leader``: returns HTTP status code **200** only when the Patroni node is running as the leader in a :ref:`standby cluster <standby_cluster>`.
+ In the following requests, since we are checking for the leader or standby-leader status, Patroni doesn't apply any of the user defined tags and they will be ignored.
+  - ``GET /?tag_key1=value1&tag_key2=value2``
+  - ``GET /master?tag_key1=value1&tag_key2=value2``
+  - ``GET /leader?tag_key1=value1&tag_key2=value2``
+  - ``GET /primary?tag_key1=value1&tag_key2=value2``
+  - ``GET /read-write?tag_key1=value1&tag_key2=value2``
+  - ``GET /standby_leader?tag_key1=value1&tag_key2=value2``
+  - ``GET /standby-leader?tag_key1=value1&tag_key2=value2``
+
+- ``GET /read-only``: like the above endpoint, but also includes the primary.
 
 - ``GET /synchronous`` or ``GET /sync``: returns HTTP status code **200** only when the Patroni node is running as a synchronous standby.
 
@@ -45,7 +57,7 @@ For all health check ``GET`` requests Patroni returns a JSON document with the s
 
 - ``GET /liveness``: always returns HTTP status code **200** what only indicates that Patroni is running. Could be used for ``livenessProbe``.
 
-- ``GET /readiness``: returns HTTP status code **200** when the Patroni node is running as the leader or when PostgreSQL is up and running. The endpoint could be used for ``readinessProbe`` when it is not possible to use Kubenetes endpoints for leader elections (OpenShift).
+- ``GET /readiness``: returns HTTP status code **200** when the Patroni node is running as the leader or when PostgreSQL is up and running. The endpoint could be used for ``readinessProbe`` when it is not possible to use Kubernetes endpoints for leader elections (OpenShift).
 
 Both, ``readiness`` and ``liveness`` endpoints are very light-weight and not executing any SQL. Probes should be configured in such a way that they start failing about time when the leader key is expiring. With the default value of ``ttl``, which is ``30s`` example probes would look like:
 

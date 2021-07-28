@@ -353,7 +353,7 @@ class ConfigHandler(object):
 
     def save_configuration_files(self, check_custom_bootstrap=False):
         """
-            copy postgresql.conf to postgresql.conf.backup to be able to retrive configuration files
+            copy postgresql.conf to postgresql.conf.backup to be able to retrieve configuration files
             - originally stored as symlinks, those are normally skipped by pg_basebackup
             - in case of WAL-E basebackup (see http://comments.gmane.org/gmane.comp.db.postgresql.wal-e/239)
         """
@@ -403,7 +403,7 @@ class ConfigHandler(object):
                     f.write_param(name, value)
             # when we are doing custom bootstrap we assume that we don't know superuser password
             # and in order to be able to change it, we are opening trust access from a certain address
-            # therefore we need to make sure that hba_file is not overriden
+            # therefore we need to make sure that hba_file is not overridden
             # after changing superuser password we will "revert" all these "changes"
             if self._postgresql.bootstrap.running_custom_bootstrap or 'hba_file' not in self._server_parameters:
                 f.write_param('hba_file', self._pg_hba_conf)
@@ -702,7 +702,9 @@ class ConfigHandler(object):
         if wal_receiver_primary_slot_name is not None:
             self._current_recovery_params['primary_slot_name'][0] = wal_receiver_primary_slot_name
 
-        required = {'restart': 0, 'reload': 0}
+        # Increment the 'reload' to enforce write of postgresql.conf when joining the running postgres
+        required = {'restart': 0,
+                    'reload': int(not self._postgresql.cb_called and self._postgresql.major_version >= 120000)}
 
         def record_missmatch(mtype):
             required['restart' if mtype else 'reload'] += 1
@@ -882,7 +884,7 @@ class ConfigHandler(object):
         unix_local_address = {'port': port}
         unix_socket_directories = self._server_parameters.get('unix_socket_directories')
         if unix_socket_directories is not None:
-            # fallback to tcp if unix_socket_directories is set, but there are no sutable values
+            # fallback to tcp if unix_socket_directories is set, but there are no suitable values
             unix_local_address['host'] = self._get_unix_local_address(unix_socket_directories) or tcp_local_address
 
         tcp_local_address = {'host': tcp_local_address, 'port': port}

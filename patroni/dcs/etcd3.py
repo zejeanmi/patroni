@@ -262,6 +262,9 @@ class Etcd3Client(AbstractEtcdClientWithFailover):
         return self.api_execute(self.version_prefix + method, self._MPOST, fields)
 
     def authenticate(self):
+        if self._use_proxies and self._cluster_version is None:
+            kwargs = self._prepare_common_parameters(1)
+            self._ensure_version_prefix(self._base_uri, **kwargs)
         if self._cluster_version >= (3, 3) and self.username and self.password:
             logger.info('Trying to authenticate on Etcd...')
             old_token, self._token = self._token, None
@@ -372,6 +375,7 @@ class KVCache(Thread):
         self._config_key = base64_encode(dcs.config_path)
         self._leader_key = base64_encode(dcs.leader_path)
         self._optime_key = base64_encode(dcs.leader_optime_path)
+        self._status_key = base64_encode(dcs.status_path)
         self._name = base64_encode(dcs._name)
         self._is_ready = False
         self._response = None
@@ -418,14 +422,15 @@ class KVCache(Thread):
             new_value = kv.get('value')
 
             value_changed = old_value != new_value and \
-                (key == self._leader_key or key == self._optime_key and new_value is not None or
+                (key == self._leader_key or key in (self._optime_key, self._status_key) and new_value is not None or
                  key == self._config_key and old_value is not None and new_value is not None)
 
             if value_changed:
                 logger.debug('%s changed from %s to %s', key, old_value, new_value)
 
-            # We also want to wake up HA loop on replicas if leader optime was updated
-            if value_changed and (key != self._optime_key or self.get(self._leader_key) != self._name):
+            # We also want to wake up HA loop on replicas if leader optime (or status key) was updated
+            if value_changed and (key not in (self._optime_key, self._status_key) or
+                                  (self.get(self._leader_key) or {}).get('value') != self._name):
                 self._dcs.event.set()
 
     def _process_message(self, message):
@@ -612,7 +617,7 @@ class Etcd3(AbstractEtcd):
             return self.retry(self._do_refresh_lease)
         except (Etcd3ClientError, RetryFailedError):
             logger.exception('refresh_lease')
-        raise Etcd3Error('Failed ro keepalive/grant lease')
+        raise Etcd3Error('Failed to keepalive/grant lease')
 
     def create_lease(self):
         while not self._lease:

@@ -84,7 +84,7 @@ class Ha(object):
         self._disable_sync = 0
 
         # We need following property to avoid shutdown of postgres when join of Patroni to the postgres
-        # already running as replica was aborted due to cluster not beeing initialized in DCS.
+        # already running as replica was aborted due to cluster not being initialized in DCS.
         self._join_aborted = False
 
         # used only in backoff after failing a pre_promote script
@@ -404,7 +404,7 @@ class Ha(object):
                     self.state_handler.set_role('replica')
 
                 if not node_to_follow:
-                    return 'no action'
+                    return 'no action. I am ({0})'.format(self.state_handler.name)
         elif is_leader:
             self.demote('immediate-nolock')
             return demote_reason
@@ -416,6 +416,9 @@ class Ha(object):
         msg = self._handle_rewind_or_reinitialize()
         if msg:
             return msg
+
+        if not self.is_paused():
+            self.state_handler.handle_parameter_change()
 
         role = 'standby_leader' if isinstance(node_to_follow, RemoteMember) and self.has_lock(False) else 'replica'
         # It might happen that leader key in the standby cluster references non-exiting member.
@@ -992,14 +995,14 @@ class Ha(object):
                     # in case of standby cluster we don't really need to
                     # enforce anything, since the leader is not a master.
                     # So just remind the role.
-                    msg = 'no action.  i am the standby leader with the lock' \
+                    msg = 'no action. I am ({0}) the standby leader with the lock'.format(self.state_handler.name) \
                           if self.state_handler.role == 'standby_leader' else \
                           'promoted self to a standby leader because i had the session lock'
                     return self.enforce_follow_remote_master(msg)
                 else:
                     return self.enforce_master_role(
-                        'no action.  i am the leader with the lock',
-                        'promoted self to leader because i had the session lock'
+                        'no action. I am ({0}) the leader with the lock'.format(self.state_handler.name),
+                        'promoted self to leader because I had the session lock'
                     )
             else:
                 # Either there is no connection to DCS or someone else acquired the lock
@@ -1012,12 +1015,15 @@ class Ha(object):
                 else:
                     return 'not promoting because failed to update leader lock in DCS'
         else:
-            logger.info('does not have lock')
+            logger.debug('does not have lock')
+        lock_owner = self.cluster.leader and self.cluster.leader.name
         if self.is_standby_cluster():
-            return self.follow('cannot be a real master in standby cluster',
-                               'no action.  i am a secondary and i am following a standby leader', refresh=False)
-        return self.follow('demoting self because i do not have the lock and i was a leader',
-                           'no action.  i am a secondary and i am following a leader', refresh=False)
+            return self.follow('cannot be a real primary in a standby cluster',
+                               'no action. I am a secondary ({0}) and following a standby leader ({1})'.format(
+                                    self.state_handler.name, lock_owner), refresh=False)
+        return self.follow('demoting self because I do not have the lock and I was a leader',
+                           'no action. I am a secondary ({0}) and following a leader ({1})'.format(
+                                self.state_handler.name, lock_owner), refresh=False)
 
     def evaluate_scheduled_restart(self):
         if self._async_executor.busy:  # Restart already in progress
@@ -1213,9 +1219,6 @@ class Ha(object):
                 self._delete_leader()
                 return 'removed leader key after trying and failing to start postgres'
             return 'failed to start postgres'
-        self._crash_recovery_executed = False
-        if self._rewind.executed and not self._rewind.failed:
-            self._rewind.reset_state()
         return None
 
     def cancel_initialization(self):
@@ -1302,8 +1305,12 @@ class Ha(object):
     def _run_cycle(self):
         dcs_failed = False
         try:
-            self.load_cluster_from_dcs()
-            self.state_handler.reset_cluster_info_state(self.cluster, self.patroni.nofailover)
+            try:
+                self.load_cluster_from_dcs()
+                self.state_handler.reset_cluster_info_state(self.cluster, self.patroni.nofailover)
+            except Exception:
+                self.state_handler.reset_cluster_info_state(None, self.patroni.nofailover)
+                raise
 
             if self.is_paused():
                 self.watchdog.disable()
@@ -1335,12 +1342,24 @@ class Ha(object):
             if self.state_handler.bootstrapping:
                 return self.post_bootstrap()
 
-            if self.recovering and not self._rewind.is_needed:
+            if self.recovering:
                 self.recovering = False
-                # Check if we tried to recover and failed
-                msg = self.post_recover()
-                if msg is not None:
-                    return msg
+
+                if not self._rewind.is_needed:
+                    # Check if we tried to recover from postgres crash and failed
+                    msg = self.post_recover()
+                    if msg is not None:
+                        return msg
+
+                # Reset some states after postgres successfully started up
+                self._crash_recovery_executed = False
+                if self._rewind.executed and not self._rewind.failed:
+                    self._rewind.reset_state()
+
+                # The Raft cluster without a quorum takes a bit of time to stabilize.
+                # Therefore we want to postpone the leader race if we just started up.
+                if self.cluster.is_unlocked() and self.dcs.__class__.__name__ == 'Raft':
+                    return 'started as a secondary'
 
             # is data directory empty?
             if self.state_handler.data_directory_empty():

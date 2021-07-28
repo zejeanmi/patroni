@@ -157,7 +157,8 @@ def run_async(self, func, args=()):
 @patch.object(Postgresql, 'controldata', Mock(return_value={
     'Database system identifier': SYSID,
     'Database cluster state': 'shut down',
-    'Latest checkpoint location': '0/12345678'}))
+    'Latest checkpoint location': '0/12345678',
+    "Latest checkpoint's TimeLineID": '2'}))
 @patch.object(SlotsHandler, 'load_replication_slots', Mock(side_effect=Exception))
 @patch.object(ConfigHandler, 'append_pg_hba', Mock())
 @patch.object(ConfigHandler, 'write_pgpass', Mock(return_value={}))
@@ -250,6 +251,15 @@ class TestHa(PostgresInit):
         self.assertEqual(self.ha.run_cycle(), 'starting as a secondary')
         self.assertEqual(self.ha.run_cycle(), 'failed to start postgres')
 
+    def test_recover_raft(self):
+        self.p.controldata = lambda: {'Database cluster state': 'in recovery', 'Database system identifier': SYSID}
+        self.p.is_running = false
+        self.p.follow = true
+        self.assertEqual(self.ha.run_cycle(), 'starting as a secondary')
+        self.p.is_running = true
+        self.ha.dcs.__class__.__name__ = 'Raft'
+        self.assertEqual(self.ha.run_cycle(), 'started as a secondary')
+
     def test_recover_former_master(self):
         self.p.follow = false
         self.p.is_running = false
@@ -278,7 +288,17 @@ class TestHa(PostgresInit):
     def test_recover_with_rewind(self):
         self.p.is_running = false
         self.ha.cluster = get_cluster_initialized_with_leader()
-        self.assertEqual(self.ha.run_cycle(), 'running pg_rewind from leader')
+        self.ha.cluster.leader.member.data.update(version='2.0.2', role='master')
+        self.ha._rewind.pg_rewind = true
+        self.ha._rewind.check_leader_is_not_in_recovery = true
+        with patch.object(Rewind, 'rewind_or_reinitialize_needed_and_possible', Mock(return_value=True)):
+            self.assertEqual(self.ha.run_cycle(), 'running pg_rewind from leader')
+        with patch.object(Rewind, 'rewind_or_reinitialize_needed_and_possible', Mock(return_value=False)):
+            self.p.follow = true
+            self.assertEqual(self.ha.run_cycle(), 'starting as a secondary')
+            self.p.is_running = true
+            self.ha.follow = Mock(return_value='fake')
+            self.assertEqual(self.ha.run_cycle(), 'fake')
 
     @patch.object(Rewind, 'rewind_or_reinitialize_needed_and_possible', Mock(return_value=True))
     @patch.object(Bootstrap, 'create_replica', Mock(return_value=1))
@@ -300,7 +320,7 @@ class TestHa(PostgresInit):
         self.p.is_healthy = true
         self.ha.has_lock = true
         self.p.controldata = lambda: {'Database cluster state': 'in production', 'Database system identifier': SYSID}
-        self.assertEqual(self.ha.run_cycle(), 'promoted self to leader because i had the session lock')
+        self.assertEqual(self.ha.run_cycle(), 'promoted self to leader because I had the session lock')
 
     @patch('psycopg2.connect', psycopg2_connect)
     def test_acquire_lock_as_master(self):
@@ -329,7 +349,7 @@ class TestHa(PostgresInit):
         self.ha.has_lock = true
         self.p.is_leader = false
         self.p.set_role('master')
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am the leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am (postgresql0) the leader with the lock')
 
     def test_demote_after_failing_to_obtain_lock(self):
         self.ha.acquire_lock = false
@@ -354,7 +374,7 @@ class TestHa(PostgresInit):
         self.ha.cluster.is_unlocked = false
         self.ha.has_lock = true
         self.p.is_leader = false
-        self.assertEqual(self.ha.run_cycle(), 'promoted self to leader because i had the session lock')
+        self.assertEqual(self.ha.run_cycle(), 'promoted self to leader because I had the session lock')
 
     def test_promote_without_watchdog(self):
         self.ha.cluster.is_unlocked = false
@@ -369,12 +389,12 @@ class TestHa(PostgresInit):
         self.ha.cluster = get_cluster_initialized_with_leader()
         self.ha.cluster.is_unlocked = false
         self.ha.has_lock = true
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am the leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am (postgresql0) the leader with the lock')
 
     def test_demote_because_not_having_lock(self):
         self.ha.cluster.is_unlocked = false
         with patch.object(Watchdog, 'is_running', PropertyMock(return_value=True)):
-            self.assertEqual(self.ha.run_cycle(), 'demoting self because i do not have the lock and i was a leader')
+            self.assertEqual(self.ha.run_cycle(), 'demoting self because I do not have the lock and I was a leader')
 
     def test_demote_because_update_lock_failed(self):
         self.ha.cluster.is_unlocked = false
@@ -388,16 +408,16 @@ class TestHa(PostgresInit):
     def test_follow(self):
         self.ha.cluster.is_unlocked = false
         self.p.is_leader = false
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am a secondary and i am following a leader')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am a secondary (postgresql0) and following a leader ()')
         self.ha.patroni.replicatefrom = "foo"
         self.p.config.check_recovery_conf = Mock(return_value=(True, False))
         self.ha.cluster.config.data.update({'slots': {'l': {'database': 'a', 'plugin': 'b'}}})
         self.ha.cluster.members[1].data['tags']['replicatefrom'] = 'postgresql0'
         self.ha.patroni.nofailover = True
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am a secondary and i am following a leader')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am a secondary (postgresql0) and following a leader ()')
         del self.ha.cluster.config.data['slots']
         self.ha.cluster.config.data.update({'postgresql': {'use_slots': False}})
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am a secondary and i am following a leader')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am a secondary (postgresql0) and following a leader ()')
         del self.ha.cluster.config.data['postgresql']['use_slots']
 
     def test_follow_in_pause(self):
@@ -405,7 +425,7 @@ class TestHa(PostgresInit):
         self.ha.is_paused = true
         self.assertEqual(self.ha.run_cycle(), 'PAUSE: continue to run as master without lock')
         self.p.is_leader = false
-        self.assertEqual(self.ha.run_cycle(), 'PAUSE: no action')
+        self.assertEqual(self.ha.run_cycle(), 'PAUSE: no action. I am (postgresql0)')
 
     @patch.object(Rewind, 'rewind_or_reinitialize_needed_and_possible', Mock(return_value=True))
     @patch.object(Rewind, 'can_rewind', PropertyMock(return_value=True))
@@ -516,27 +536,27 @@ class TestHa(PostgresInit):
         self.ha.fetch_node_status = get_node_status()
         self.ha.has_lock = true
         self.ha.cluster = get_cluster_initialized_with_leader(Failover(0, 'blabla', '', None))
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am the leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am (postgresql0) the leader with the lock')
         self.ha.cluster = get_cluster_initialized_with_leader(Failover(0, '', self.p.name, None))
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am the leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am (postgresql0) the leader with the lock')
         self.ha.cluster = get_cluster_initialized_with_leader(Failover(0, '', 'blabla', None))
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am the leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am (postgresql0) the leader with the lock')
         f = Failover(0, self.p.name, '', None)
         self.ha.cluster = get_cluster_initialized_with_leader(f)
         self.assertEqual(self.ha.run_cycle(), 'manual failover: demoting myself')
         self.ha._rewind.rewind_or_reinitialize_needed_and_possible = true
         self.assertEqual(self.ha.run_cycle(), 'manual failover: demoting myself')
         self.ha.fetch_node_status = get_node_status(nofailover=True)
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am the leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am (postgresql0) the leader with the lock')
         self.ha.fetch_node_status = get_node_status(watchdog_failed=True)
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am the leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am (postgresql0) the leader with the lock')
         self.ha.fetch_node_status = get_node_status(timeline=1)
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am the leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am (postgresql0) the leader with the lock')
         self.ha.fetch_node_status = get_node_status(wal_position=1)
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am the leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am (postgresql0) the leader with the lock')
         # manual failover from the previous leader to us won't happen if we hold the nofailover flag
         self.ha.cluster = get_cluster_initialized_with_leader(Failover(0, 'blabla', self.p.name, None))
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am the leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am (postgresql0) the leader with the lock')
 
         # Failover scheduled time must include timezone
         scheduled = datetime.datetime.now()
@@ -545,28 +565,28 @@ class TestHa(PostgresInit):
 
         scheduled = datetime.datetime.utcnow().replace(tzinfo=tzutc)
         self.ha.cluster = get_cluster_initialized_with_leader(Failover(0, 'blabla', self.p.name, scheduled))
-        self.assertEqual('no action.  i am the leader with the lock', self.ha.run_cycle())
+        self.assertEqual('no action. I am (postgresql0) the leader with the lock', self.ha.run_cycle())
 
         scheduled = scheduled + datetime.timedelta(seconds=30)
         self.ha.cluster = get_cluster_initialized_with_leader(Failover(0, 'blabla', self.p.name, scheduled))
-        self.assertEqual('no action.  i am the leader with the lock', self.ha.run_cycle())
+        self.assertEqual('no action. I am (postgresql0) the leader with the lock', self.ha.run_cycle())
 
         scheduled = scheduled + datetime.timedelta(seconds=-600)
         self.ha.cluster = get_cluster_initialized_with_leader(Failover(0, 'blabla', self.p.name, scheduled))
-        self.assertEqual('no action.  i am the leader with the lock', self.ha.run_cycle())
+        self.assertEqual('no action. I am (postgresql0) the leader with the lock', self.ha.run_cycle())
 
         scheduled = None
         self.ha.cluster = get_cluster_initialized_with_leader(Failover(0, 'blabla', self.p.name, scheduled))
-        self.assertEqual('no action.  i am the leader with the lock', self.ha.run_cycle())
+        self.assertEqual('no action. I am (postgresql0) the leader with the lock', self.ha.run_cycle())
 
     def test_manual_failover_from_leader_in_pause(self):
         self.ha.has_lock = true
         self.ha.is_paused = true
         scheduled = datetime.datetime.now()
         self.ha.cluster = get_cluster_initialized_with_leader(Failover(0, 'blabla', self.p.name, scheduled))
-        self.assertEqual('PAUSE: no action.  i am the leader with the lock', self.ha.run_cycle())
+        self.assertEqual('PAUSE: no action. I am (postgresql0) the leader with the lock', self.ha.run_cycle())
         self.ha.cluster = get_cluster_initialized_with_leader(Failover(0, self.p.name, '', None))
-        self.assertEqual('PAUSE: no action.  i am the leader with the lock', self.ha.run_cycle())
+        self.assertEqual('PAUSE: no action. I am (postgresql0) the leader with the lock', self.ha.run_cycle())
 
     def test_manual_failover_from_leader_in_synchronous_mode(self):
         self.p.is_leader = true
@@ -575,7 +595,7 @@ class TestHa(PostgresInit):
         self.ha.is_failover_possible = false
         self.ha.process_sync_replication = Mock()
         self.ha.cluster = get_cluster_initialized_with_leader(Failover(0, self.p.name, 'a', None), (self.p.name, None))
-        self.assertEqual('no action.  i am the leader with the lock', self.ha.run_cycle())
+        self.assertEqual('no action. I am (postgresql0) the leader with the lock', self.ha.run_cycle())
         self.ha.cluster = get_cluster_initialized_with_leader(Failover(0, self.p.name, 'a', None), (self.p.name, 'a'))
         self.ha.is_failover_possible = true
         self.assertEqual('manual failover: demoting myself', self.ha.run_cycle())
@@ -681,7 +701,7 @@ class TestHa(PostgresInit):
 
     def test_evaluate_scheduled_restart(self):
         self.p.postmaster_start_time = Mock(return_value=str(postmaster_start_time))
-        # restart already in progres
+        # restart already in progress
         with patch('patroni.async_executor.AsyncExecutor.busy', PropertyMock(return_value=True)):
             self.assertIsNone(self.ha.evaluate_scheduled_restart())
         # restart while the postmaster has been already restarted, fails
@@ -736,7 +756,7 @@ class TestHa(PostgresInit):
         self.p.config.check_recovery_conf = Mock(return_value=(False, False))
         self.ha._leader_timeline = 1
         self.assertEqual(self.ha.run_cycle(), 'promoted self to a standby leader because i had the session lock')
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am the standby leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am (leader) the standby leader with the lock')
         self.p.set_role('replica')
         self.p.config.check_recovery_conf = Mock(return_value=(True, False))
         self.assertEqual(self.ha.run_cycle(), 'promoted self to a standby leader because i had the session lock')
@@ -745,7 +765,8 @@ class TestHa(PostgresInit):
         self.p.is_leader = false
         self.p.name = 'replica'
         self.ha.cluster = get_standby_cluster_initialized_with_only_leader()
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am a secondary and i am following a standby leader')
+        self.assertEqual(self.ha.run_cycle(),
+                         'no action. I am a secondary (replica) and following a standby leader (leader)')
         with patch.object(Leader, 'conn_url', PropertyMock(return_value='')):
             self.assertEqual(self.ha.run_cycle(), 'continue following the old known standby leader')
 
@@ -838,7 +859,8 @@ class TestHa(PostgresInit):
 
         self.ha.has_lock = false
         self.p.is_leader = false
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am a secondary and i am following a leader')
+        self.assertEqual(self.ha.run_cycle(),
+                         'no action. I am a secondary (postgresql0) and following a leader (leader)')
         check_calls([(update_lock, False), (demote, False)])
 
     def test_manual_failover_while_starting(self):
@@ -1063,7 +1085,7 @@ class TestHa(PostgresInit):
         self.ha.cluster.config.data.clear()
         self.ha.has_lock = true
         self.ha.cluster.is_unlocked = false
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am the leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am (postgresql0) the leader with the lock')
 
     def test_watch(self):
         self.ha.cluster = get_cluster_initialized_with_leader()
@@ -1098,7 +1120,7 @@ class TestHa(PostgresInit):
         self.ha.cluster.is_unlocked = false
         for tl in (1, 3):
             self.p.get_master_timeline = Mock(return_value=tl)
-            self.assertEqual(self.ha.run_cycle(), 'no action.  i am the leader with the lock')
+            self.assertEqual(self.ha.run_cycle(), 'no action. I am (postgresql0) the leader with the lock')
 
     @patch('sys.exit', return_value=1)
     def test_abort_join(self, exit_mock):
@@ -1111,9 +1133,9 @@ class TestHa(PostgresInit):
         self.ha.has_lock = true
         self.ha.cluster.is_unlocked = false
         self.ha.is_paused = true
-        self.assertEqual(self.ha.run_cycle(), 'PAUSE: no action.  i am the leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'PAUSE: no action. I am (postgresql0) the leader with the lock')
         self.ha.is_paused = false
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am the leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am (postgresql0) the leader with the lock')
 
     @patch('psycopg2.connect', psycopg2_connect)
     def test_permanent_logical_slots_after_promote(self):
@@ -1123,7 +1145,7 @@ class TestHa(PostgresInit):
         self.assertEqual(self.ha.run_cycle(), 'acquired session lock as a leader')
         self.ha.cluster = get_cluster_initialized_without_leader(leader=True, cluster_config=config)
         self.ha.has_lock = true
-        self.assertEqual(self.ha.run_cycle(), 'no action.  i am the leader with the lock')
+        self.assertEqual(self.ha.run_cycle(), 'no action. I am (other) the leader with the lock')
 
     @patch.object(Cluster, 'has_member', true)
     def test_run_cycle(self):
